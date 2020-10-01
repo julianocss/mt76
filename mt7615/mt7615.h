@@ -589,9 +589,8 @@ int mt7615_mac_wtbl_update_key(struct mt7615_dev *dev,
 void mt7615_mac_reset_work(struct work_struct *work);
 u32 mt7615_mac_get_sta_tid_sn(struct mt7615_dev *dev, int wcid, u8 tid);
 
-int mt7615_mcu_wait_response(struct mt7615_dev *dev, int cmd, int seq);
-int mt7615_mcu_msg_send(struct mt76_dev *mdev, int cmd, const void *data,
-			int len, bool wait_resp);
+int mt7615_mcu_parse_response(struct mt76_dev *mdev, int cmd,
+			      struct sk_buff *skb, int seq);
 u32 mt7615_rf_rr(struct mt7615_dev *dev, u32 wf, u32 reg);
 int mt7615_rf_wr(struct mt7615_dev *dev, u32 wf, u32 reg, u32 val);
 int mt7615_mcu_set_dbdc(struct mt7615_dev *dev);
@@ -683,7 +682,7 @@ int mt7663u_mcu_init(struct mt7615_dev *dev);
 /* sdio */
 u32 mt7663s_read_pcr(struct mt7615_dev *dev);
 int mt7663s_mcu_init(struct mt7615_dev *dev);
-void mt7663s_tx_work(struct work_struct *work);
+void mt7663s_txrx_worker(struct mt76_worker *w);
 void mt7663s_rx_work(struct work_struct *work);
 void mt7663s_sdio_irq(struct sdio_func *func);
 

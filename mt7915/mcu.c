@@ -215,14 +215,53 @@ mt7915_mcu_get_sta_nss(u16 mcs_map)
 	return nss - 1;
 }
 
-static int __mt7915_mcu_msg_send(struct mt7915_dev *dev, struct sk_buff *skb,
-				 int cmd, int *wait_seq)
+static int
+mt7915_mcu_parse_response(struct mt76_dev *mdev, int cmd,
+			  struct sk_buff *skb, int seq)
 {
+	struct mt7915_mcu_rxd *rxd;
+	int ret = 0;
+
+	if (!skb) {
+		dev_err(mdev->dev, "Message %d (seq %d) timeout\n",
+			cmd, seq);
+		return -ETIMEDOUT;
+	}
+
+	rxd = (struct mt7915_mcu_rxd *)skb->data;
+	if (seq != rxd->seq)
+		return -EAGAIN;
+
+	switch (cmd) {
+	case -MCU_CMD_PATCH_SEM_CONTROL:
+		skb_pull(skb, sizeof(*rxd) - 4);
+		ret = *skb->data;
+		break;
+	case MCU_EXT_CMD_THERMAL_CTRL:
+		skb_pull(skb, sizeof(*rxd) + 4);
+		ret = le32_to_cpu(*(__le32 *)skb->data);
+		break;
+	default:
+		skb_pull(skb, sizeof(struct mt7915_mcu_rxd));
+		break;
+	}
+
+	return ret;
+}
+
+static int
+mt7915_mcu_send_message(struct mt76_dev *mdev, struct sk_buff *skb,
+			int cmd, int *wait_seq)
+{
+	struct mt7915_dev *dev = container_of(mdev, struct mt7915_dev, mt76);
 	struct mt7915_mcu_txd *mcu_txd;
 	u8 seq, pkt_fmt, qidx;
 	enum mt76_txq_id txq;
 	__le32 *txd;
 	u32 val;
+
+	/* TODO: make dynamic based on msg type */
+	mdev->mcu.timeout = 20 * HZ;
 
 	seq = ++dev->mt76.mcu.msg_seq & 0xf;
 	if (!seq)
@@ -288,115 +327,6 @@ exit:
 		*wait_seq = seq;
 
 	return mt76_tx_queue_skb_raw(dev, txq, skb, 0);
-}
-
-static int
-mt7915_mcu_parse_eeprom(struct mt7915_dev *dev, struct sk_buff *skb)
-{
-	struct mt7915_mcu_eeprom_info *res;
-	u8 *buf;
-
-	if (!skb)
-		return -EINVAL;
-
-	skb_pull(skb, sizeof(struct mt7915_mcu_rxd));
-
-	res = (struct mt7915_mcu_eeprom_info *)skb->data;
-	buf = dev->mt76.eeprom.data + le32_to_cpu(res->addr);
-	memcpy(buf, res->data, 16);
-
-	return 0;
-}
-
-static int
-mt7915_mcu_parse_response(struct mt7915_dev *dev, int cmd,
-			  struct sk_buff *skb, int seq)
-{
-	struct mt7915_mcu_rxd *rxd = (struct mt7915_mcu_rxd *)skb->data;
-	int ret = 0;
-
-	if (seq != rxd->seq) {
-		ret = -EAGAIN;
-		goto out;
-	}
-
-	switch (cmd) {
-	case -MCU_CMD_PATCH_SEM_CONTROL:
-		skb_pull(skb, sizeof(*rxd) - 4);
-		ret = *skb->data;
-		break;
-	case MCU_EXT_CMD_THERMAL_CTRL:
-		skb_pull(skb, sizeof(*rxd) + 4);
-		ret = le32_to_cpu(*(__le32 *)skb->data);
-		break;
-	case MCU_EXT_CMD_EFUSE_ACCESS:
-		ret = mt7915_mcu_parse_eeprom(dev, skb);
-		break;
-	default:
-		break;
-	}
-out:
-	dev_kfree_skb(skb);
-
-	return ret;
-}
-
-static int
-mt7915_mcu_wait_response(struct mt7915_dev *dev, int cmd, int seq)
-{
-	unsigned long expires = jiffies + 20 * HZ;
-	struct sk_buff *skb;
-	int ret = 0;
-
-	while (true) {
-		skb = mt76_mcu_get_response(&dev->mt76, expires);
-		if (!skb) {
-			dev_err(dev->mt76.dev, "Message %d (seq %d) timeout\n",
-				cmd, seq);
-			return -ETIMEDOUT;
-		}
-
-		ret = mt7915_mcu_parse_response(dev, cmd, skb, seq);
-		if (ret != -EAGAIN)
-			break;
-	}
-
-	return ret;
-}
-
-static int
-mt7915_mcu_send_message(struct mt76_dev *mdev, struct sk_buff *skb,
-			int cmd, bool wait_resp)
-{
-	struct mt7915_dev *dev = container_of(mdev, struct mt7915_dev, mt76);
-	int ret, seq;
-
-	mutex_lock(&mdev->mcu.mutex);
-
-	ret = __mt7915_mcu_msg_send(dev, skb, cmd, &seq);
-	if (ret)
-		goto out;
-
-	if (wait_resp)
-		ret = mt7915_mcu_wait_response(dev, cmd, seq);
-
-out:
-	mutex_unlock(&mdev->mcu.mutex);
-
-	return ret;
-}
-
-static int
-mt7915_mcu_msg_send(struct mt76_dev *mdev, int cmd, const void *data,
-		    int len, bool wait_resp)
-{
-	struct sk_buff *skb;
-
-	skb = mt76_mcu_msg_alloc(mdev, data, len);
-	if (!skb)
-		return -ENOMEM;
-
-	return __mt76_mcu_skb_send_msg(mdev, skb, cmd, wait_resp);
 }
 
 static void
@@ -1022,11 +952,52 @@ mt7915_mcu_bss_sync_tlv(struct sk_buff *skb, struct ieee80211_vif *vif)
 	sync->enable = true;
 }
 
+static int
+mt7915_mcu_muar_config(struct mt7915_phy *phy, struct ieee80211_vif *vif,
+		       bool bssid, bool enable)
+{
+	struct mt7915_dev *dev = phy->dev;
+	struct mt7915_vif *mvif = (struct mt7915_vif *)vif->drv_priv;
+	u32 idx = mvif->omac_idx - REPEATER_BSSID_START;
+	u32 mask = phy->omac_mask >> 32 & ~BIT(idx);
+	const u8 *addr = vif->addr;
+	struct {
+		u8 mode;
+		u8 force_clear;
+		u8 clear_bitmap[8];
+		u8 entry_count;
+		u8 write;
+		u8 band;
+
+		u8 index;
+		u8 bssid;
+		u8 addr[ETH_ALEN];
+	} __packed req = {
+		.mode = !!mask || enable,
+		.entry_count = 1,
+		.write = 1,
+
+		.index = idx * 2 + bssid,
+	};
+
+	if (bssid)
+		addr = vif->bss_conf.bssid;
+
+	if (enable)
+		ether_addr_copy(req.addr, addr);
+
+	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_MUAR_UPDATE, &req,
+				 sizeof(req), true);
+}
+
 int mt7915_mcu_add_bss_info(struct mt7915_phy *phy,
 			    struct ieee80211_vif *vif, int enable)
 {
 	struct mt7915_vif *mvif = (struct mt7915_vif *)vif->drv_priv;
 	struct sk_buff *skb;
+
+	if (mvif->omac_idx >= REPEATER_BSSID_START)
+		mt7915_mcu_muar_config(phy, vif, true, enable);
 
 	skb = mt7915_mcu_alloc_sta_req(phy->dev, mvif, NULL,
 				       MT7915_BSS_UPDATE_MAX_SIZE);
@@ -1048,14 +1019,14 @@ int mt7915_mcu_add_bss_info(struct mt7915_phy *phy,
 		if (vif->bss_conf.he_support)
 			mt7915_mcu_bss_he_tlv(skb, vif, phy);
 
-		if (mvif->omac_idx > HW_BSSID_MAX)
-			mt7915_mcu_bss_ext_tlv(skb, mvif);
-		else
+		if (mvif->omac_idx < EXT_BSSID_START)
 			mt7915_mcu_bss_sync_tlv(skb, vif);
+		else if (mvif->omac_idx < REPEATER_BSSID_START)
+			mt7915_mcu_bss_ext_tlv(skb, mvif);
 	}
 
-	return __mt76_mcu_skb_send_msg(&phy->dev->mt76, skb,
-				       MCU_EXT_CMD_BSS_INFO_UPDATE, true);
+	return mt76_mcu_skb_send_msg(&phy->dev->mt76, skb,
+				     MCU_EXT_CMD_BSS_INFO_UPDATE, true);
 }
 
 /** starec & wtbl **/
@@ -1136,8 +1107,8 @@ int mt7915_mcu_add_key(struct mt7915_dev *dev, struct ieee80211_vif *vif,
 	if (ret)
 		return ret;
 
-	return __mt76_mcu_skb_send_msg(&dev->mt76, skb,
-				       MCU_EXT_CMD_STA_REC_UPDATE, true);
+	return mt76_mcu_skb_send_msg(&dev->mt76, skb,
+				     MCU_EXT_CMD_STA_REC_UPDATE, true);
 }
 
 static void
@@ -1216,8 +1187,8 @@ mt7915_mcu_sta_ba(struct mt7915_dev *dev,
 					     &skb);
 	mt7915_mcu_wtbl_ba_tlv(skb, params, enable, tx, sta_wtbl, wtbl_hdr);
 
-	ret = __mt76_mcu_skb_send_msg(&dev->mt76, skb,
-				      MCU_EXT_CMD_STA_REC_UPDATE, true);
+	ret = mt76_mcu_skb_send_msg(&dev->mt76, skb,
+				    MCU_EXT_CMD_STA_REC_UPDATE, true);
 	if (ret)
 		return ret;
 
@@ -1228,8 +1199,8 @@ mt7915_mcu_sta_ba(struct mt7915_dev *dev,
 
 	mt7915_mcu_sta_ba_tlv(skb, params, enable, tx);
 
-	return __mt76_mcu_skb_send_msg(&dev->mt76, skb,
-				       MCU_EXT_CMD_STA_REC_UPDATE, true);
+	return mt76_mcu_skb_send_msg(&dev->mt76, skb,
+				     MCU_EXT_CMD_STA_REC_UPDATE, true);
 }
 
 int mt7915_mcu_add_tx_ba(struct mt7915_dev *dev,
@@ -1511,9 +1482,7 @@ mt7915_mcu_sta_muru_tlv(struct sk_buff *skb, struct ieee80211_sta *sta)
 
 	muru = (struct sta_rec_muru *)tlv;
 	muru->cfg.ofdma_dl_en = true;
-	muru->cfg.ofdma_ul_en = true;
 	muru->cfg.mimo_dl_en = true;
-	muru->cfg.mimo_ul_en = true;
 
 	muru->ofdma_dl.punc_pream_rx =
 		HE_PHY(CAP1_PREAMBLE_PUNC_RX_MASK, elem->phy_cap_info[1]);
@@ -1566,8 +1535,8 @@ mt7915_mcu_add_mu(struct mt7915_dev *dev, struct ieee80211_vif *vif,
 	/* starec muru */
 	mt7915_mcu_sta_muru_tlv(skb, sta);
 
-	return __mt76_mcu_skb_send_msg(&dev->mt76, skb,
-				       MCU_EXT_CMD_STA_REC_UPDATE, true);
+	return mt76_mcu_skb_send_msg(&dev->mt76, skb,
+				     MCU_EXT_CMD_STA_REC_UPDATE, true);
 }
 
 static void
@@ -1734,7 +1703,8 @@ int mt7915_mcu_sta_update_hdr_trans(struct mt7915_dev *dev,
 	wtbl_hdr = mt7915_mcu_alloc_wtbl_req(dev, msta, WTBL_SET, NULL, &skb);
 	mt7915_mcu_wtbl_hdr_trans_tlv(skb, vif, sta, NULL, wtbl_hdr);
 
-	return __mt76_mcu_skb_send_msg(&dev->mt76, skb, MCU_EXT_CMD_WTBL_UPDATE, true);
+	return mt76_mcu_skb_send_msg(&dev->mt76, skb, MCU_EXT_CMD_WTBL_UPDATE,
+				     true);
 }
 
 int mt7915_mcu_add_smps(struct mt7915_dev *dev, struct ieee80211_vif *vif,
@@ -1757,8 +1727,8 @@ int mt7915_mcu_add_smps(struct mt7915_dev *dev, struct ieee80211_vif *vif,
 					     &skb);
 	mt7915_mcu_wtbl_smps_tlv(skb, sta, sta_wtbl, wtbl_hdr);
 
-	return __mt76_mcu_skb_send_msg(&dev->mt76, skb,
-				       MCU_EXT_CMD_STA_REC_UPDATE, true);
+	return mt76_mcu_skb_send_msg(&dev->mt76, skb,
+				     MCU_EXT_CMD_STA_REC_UPDATE, true);
 }
 
 static void
@@ -2059,8 +2029,8 @@ mt7915_mcu_add_txbf(struct mt7915_dev *dev, struct ieee80211_vif *vif,
 
 		mt7915_mcu_sta_bfer_tlv(skb, sta, vif, phy, enable);
 
-		r = __mt76_mcu_skb_send_msg(&dev->mt76, skb,
-					    MCU_EXT_CMD_STA_REC_UPDATE, true);
+		r = mt76_mcu_skb_send_msg(&dev->mt76, skb,
+					  MCU_EXT_CMD_STA_REC_UPDATE, true);
 		if (r)
 			return r;
 	}
@@ -2075,8 +2045,8 @@ mt7915_mcu_add_txbf(struct mt7915_dev *dev, struct ieee80211_vif *vif,
 
 		mt7915_mcu_sta_bfee_tlv(skb, sta, phy);
 
-		r = __mt76_mcu_skb_send_msg(&dev->mt76, skb,
-					    MCU_EXT_CMD_STA_REC_UPDATE, true);
+		r = mt76_mcu_skb_send_msg(&dev->mt76, skb,
+					  MCU_EXT_CMD_STA_REC_UPDATE, true);
 		if (r)
 			return r;
 	}
@@ -2243,8 +2213,8 @@ int mt7915_mcu_add_rate_ctrl(struct mt7915_dev *dev, struct ieee80211_vif *vif,
 
 	mt7915_mcu_sta_rate_ctrl_tlv(skb, dev, vif, sta);
 
-	return __mt76_mcu_skb_send_msg(&dev->mt76, skb,
-				       MCU_EXT_CMD_STA_REC_UPDATE, true);
+	return mt76_mcu_skb_send_msg(&dev->mt76, skb,
+				     MCU_EXT_CMD_STA_REC_UPDATE, true);
 }
 
 static int
@@ -2266,11 +2236,11 @@ mt7915_mcu_add_group(struct mt7915_dev *dev, struct ieee80211_vif *vif,
 		.action = cpu_to_le32(MT_STA_BSS_GROUP),
 		.wlan_idx_lo = to_wcid_lo(msta->wcid.idx),
 		.wlan_idx_hi = to_wcid_hi(msta->wcid.idx),
-		.val = cpu_to_le32(mvif->idx),
+		.val = cpu_to_le32(mvif->idx % 16),
 	};
 
-	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SET_DRR_CTRL,
-				   &req, sizeof(req), true);
+	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SET_DRR_CTRL, &req,
+				 sizeof(req), true);
 }
 
 int mt7915_mcu_add_sta_adv(struct mt7915_dev *dev, struct ieee80211_vif *vif,
@@ -2331,8 +2301,8 @@ int mt7915_mcu_add_sta(struct mt7915_dev *dev, struct ieee80211_vif *vif,
 			mt7915_mcu_wtbl_ht_tlv(skb, sta, sta_wtbl, wtbl_hdr);
 	}
 
-	return __mt76_mcu_skb_send_msg(&dev->mt76, skb,
-				       MCU_EXT_CMD_STA_REC_UPDATE, true);
+	return mt76_mcu_skb_send_msg(&dev->mt76, skb,
+				     MCU_EXT_CMD_STA_REC_UPDATE, true);
 }
 
 int mt7915_mcu_set_fixed_rate(struct mt7915_dev *dev,
@@ -2377,13 +2347,14 @@ int mt7915_mcu_set_fixed_rate(struct mt7915_dev *dev,
 		ra->phy.sgi = ra->phy.mcs * 15;
 
 out:
-	return __mt76_mcu_skb_send_msg(&dev->mt76, skb,
-				       MCU_EXT_CMD_STA_REC_UPDATE, true);
+	return mt76_mcu_skb_send_msg(&dev->mt76, skb,
+				     MCU_EXT_CMD_STA_REC_UPDATE, true);
 }
 
-int mt7915_mcu_add_dev_info(struct mt7915_dev *dev,
+int mt7915_mcu_add_dev_info(struct mt7915_phy *phy,
 			    struct ieee80211_vif *vif, bool enable)
 {
+	struct mt7915_dev *dev = phy->dev;
 	struct mt7915_vif *mvif = (struct mt7915_vif *)vif->drv_priv;
 	struct {
 		struct req_hdr {
@@ -2415,9 +2386,12 @@ int mt7915_mcu_add_dev_info(struct mt7915_dev *dev,
 		},
 	};
 
+	if (mvif->omac_idx >= REPEATER_BSSID_START)
+		return mt7915_mcu_muar_config(phy, vif, false, enable);
+
 	memcpy(data.tlv.omac_addr, vif->addr, ETH_ALEN);
-	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_DEV_INFO_UPDATE,
-				   &data, sizeof(data), true);
+	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_DEV_INFO_UPDATE,
+				 &data, sizeof(data), true);
 }
 
 static void
@@ -2508,8 +2482,8 @@ int mt7915_mcu_add_beacon(struct ieee80211_hw *hw,
 	mt7915_mcu_beacon_cont(dev, rskb, skb, bcn, &offs);
 	dev_kfree_skb(skb);
 
-	return __mt76_mcu_skb_send_msg(&phy->dev->mt76, rskb,
-				       MCU_EXT_CMD_BSS_INFO_UPDATE, true);
+	return mt76_mcu_skb_send_msg(&phy->dev->mt76, rskb,
+				     MCU_EXT_CMD_BSS_INFO_UPDATE, true);
 }
 
 static int mt7915_mcu_send_firmware(struct mt7915_dev *dev, const void *data,
@@ -2521,8 +2495,8 @@ static int mt7915_mcu_send_firmware(struct mt7915_dev *dev, const void *data,
 		cur_len = min_t(int, 4096 - sizeof(struct mt7915_mcu_txd),
 				len);
 
-		ret = __mt76_mcu_send_msg(&dev->mt76, -MCU_CMD_FW_SCATTER,
-					  data, cur_len, false);
+		ret = mt76_mcu_send_msg(&dev->mt76, -MCU_CMD_FW_SCATTER, data,
+					cur_len, false);
 		if (ret)
 			break;
 
@@ -2545,8 +2519,8 @@ static int mt7915_mcu_start_firmware(struct mt7915_dev *dev, u32 addr,
 		.addr = cpu_to_le32(addr),
 	};
 
-	return __mt76_mcu_send_msg(&dev->mt76, -MCU_CMD_FW_START_REQ,
-				   &req, sizeof(req), true);
+	return mt76_mcu_send_msg(&dev->mt76, -MCU_CMD_FW_START_REQ, &req,
+				 sizeof(req), true);
 }
 
 static int mt7915_mcu_restart(struct mt76_dev *dev)
@@ -2558,8 +2532,8 @@ static int mt7915_mcu_restart(struct mt76_dev *dev)
 		.power_mode = 1,
 	};
 
-	return __mt76_mcu_send_msg(dev, -MCU_CMD_NIC_POWER_CTRL, &req,
-				   sizeof(req), false);
+	return mt76_mcu_send_msg(dev, -MCU_CMD_NIC_POWER_CTRL, &req,
+				 sizeof(req), false);
 }
 
 static int mt7915_mcu_patch_sem_ctrl(struct mt7915_dev *dev, bool get)
@@ -2570,8 +2544,8 @@ static int mt7915_mcu_patch_sem_ctrl(struct mt7915_dev *dev, bool get)
 		.op = cpu_to_le32(get ? PATCH_SEM_GET : PATCH_SEM_RELEASE),
 	};
 
-	return __mt76_mcu_send_msg(&dev->mt76, -MCU_CMD_PATCH_SEM_CONTROL,
-				   &req, sizeof(req), true);
+	return mt76_mcu_send_msg(&dev->mt76, -MCU_CMD_PATCH_SEM_CONTROL, &req,
+				 sizeof(req), true);
 }
 
 static int mt7915_mcu_start_patch(struct mt7915_dev *dev)
@@ -2583,8 +2557,8 @@ static int mt7915_mcu_start_patch(struct mt7915_dev *dev)
 		.check_crc = 0,
 	};
 
-	return __mt76_mcu_send_msg(&dev->mt76, -MCU_CMD_PATCH_FINISH_REQ,
-				   &req, sizeof(req), true);
+	return mt76_mcu_send_msg(&dev->mt76, -MCU_CMD_PATCH_FINISH_REQ, &req,
+				 sizeof(req), true);
 }
 
 static int mt7915_driver_own(struct mt7915_dev *dev)
@@ -2620,7 +2594,7 @@ static int mt7915_mcu_init_download(struct mt7915_dev *dev, u32 addr,
 	else
 		attr = -MCU_CMD_TARGET_ADDRESS_LEN_REQ;
 
-	return __mt76_mcu_send_msg(&dev->mt76, attr, &req, sizeof(req), true);
+	return mt76_mcu_send_msg(&dev->mt76, attr, &req, sizeof(req), true);
 }
 
 static int mt7915_load_patch(struct mt7915_dev *dev)
@@ -2876,8 +2850,8 @@ int mt7915_mcu_fw_log_2_host(struct mt7915_dev *dev, u8 ctrl)
 		.ctrl_val = ctrl
 	};
 
-	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_FW_LOG_2_HOST,
-				   &data, sizeof(data), true);
+	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_FW_LOG_2_HOST, &data,
+				 sizeof(data), true);
 }
 
 int mt7915_mcu_fw_dbg_ctrl(struct mt7915_dev *dev, u32 module, u8 level)
@@ -2894,8 +2868,8 @@ int mt7915_mcu_fw_dbg_ctrl(struct mt7915_dev *dev, u32 module, u8 level)
 		.level = level,
 	};
 
-	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_FW_DBG_CTRL,
-				   &data, sizeof(data), false);
+	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_FW_DBG_CTRL, &data,
+				 sizeof(data), false);
 }
 
 static int mt7915_mcu_set_mwds(struct mt7915_dev *dev, bool enabled)
@@ -2907,8 +2881,8 @@ static int mt7915_mcu_set_mwds(struct mt7915_dev *dev, bool enabled)
 		.enable = enabled
 	};
 
-	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_MWDS_SUPPORT,
-				   &req, sizeof(req), false);
+	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_MWDS_SUPPORT, &req,
+				 sizeof(req), false);
 }
 
 int mt7915_mcu_init(struct mt7915_dev *dev)
@@ -2916,7 +2890,7 @@ int mt7915_mcu_init(struct mt7915_dev *dev)
 	static const struct mt76_mcu_ops mt7915_mcu_ops = {
 		.headroom = sizeof(struct mt7915_mcu_txd),
 		.mcu_skb_send_msg = mt7915_mcu_send_message,
-		.mcu_send_msg = mt7915_mcu_msg_send,
+		.mcu_parse_response = mt7915_mcu_parse_response,
 		.mcu_restart = mt7915_mcu_restart,
 	};
 	int ret;
@@ -2980,13 +2954,13 @@ int mt7915_mcu_set_mac(struct mt7915_dev *dev, int band,
 	};
 	int ret;
 
-	ret = __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_RX_HDR_TRANS,
-				  &req_trans, sizeof(req_trans), false);
+	ret = mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_RX_HDR_TRANS,
+				&req_trans, sizeof(req_trans), false);
 	if (ret)
 		return ret;
 
-	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_MAC_INIT_CTRL,
-				   &req_mac, sizeof(req_mac), true);
+	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_MAC_INIT_CTRL,
+				 &req_mac, sizeof(req_mac), true);
 }
 
 int mt7915_mcu_set_scs(struct mt7915_dev *dev, u8 band, bool enable)
@@ -3001,8 +2975,8 @@ int mt7915_mcu_set_scs(struct mt7915_dev *dev, u8 band, bool enable)
 		.enable = enable + 1,
 	};
 
-	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SCS_CTRL, &req,
-				   sizeof(req), false);
+	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SCS_CTRL, &req,
+				 sizeof(req), false);
 }
 
 int mt7915_mcu_set_rts_thresh(struct mt7915_phy *phy, u32 val)
@@ -3021,8 +2995,8 @@ int mt7915_mcu_set_rts_thresh(struct mt7915_phy *phy, u32 val)
 		.pkt_thresh = cpu_to_le32(0x2),
 	};
 
-	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_PROTECT_CTRL,
-				   &req, sizeof(req), true);
+	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_PROTECT_CTRL, &req,
+				 sizeof(req), true);
 }
 
 int mt7915_mcu_set_tx(struct mt7915_dev *dev, struct ieee80211_vif *vif)
@@ -3075,8 +3049,8 @@ int mt7915_mcu_set_tx(struct mt7915_dev *dev, struct ieee80211_vif *vif)
 		else
 			e->cw_max = cpu_to_le16(10);
 	}
-	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_EDCA_UPDATE,
-				  &req, sizeof(req), true);
+	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_EDCA_UPDATE, &req,
+				 sizeof(req), true);
 }
 
 int mt7915_mcu_set_pm(struct mt7915_dev *dev, int band, int enter)
@@ -3106,8 +3080,8 @@ int mt7915_mcu_set_pm(struct mt7915_dev *dev, int band, int enter)
 		.band_idx = band,
 	};
 
-	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_PM_STATE_CTRL,
-				   &req, sizeof(req), true);
+	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_PM_STATE_CTRL, &req,
+				 sizeof(req), true);
 }
 
 int mt7915_mcu_rdd_cmd(struct mt7915_dev *dev,
@@ -3127,8 +3101,8 @@ int mt7915_mcu_rdd_cmd(struct mt7915_dev *dev,
 		.val = val,
 	};
 
-	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SET_RDD_CTRL,
-				   &req, sizeof(req), true);
+	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SET_RDD_CTRL, &req,
+				 sizeof(req), true);
 }
 
 int mt7915_mcu_set_fcc5_lpn(struct mt7915_dev *dev, int val)
@@ -3142,8 +3116,8 @@ int mt7915_mcu_set_fcc5_lpn(struct mt7915_dev *dev, int val)
 		.min_lpn = val,
 	};
 
-	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SET_RDD_TH,
-				   &req, sizeof(req), true);
+	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SET_RDD_TH, &req,
+				 sizeof(req), true);
 }
 
 int mt7915_mcu_set_pulse_th(struct mt7915_dev *dev,
@@ -3158,8 +3132,8 @@ int mt7915_mcu_set_pulse_th(struct mt7915_dev *dev,
 
 	memcpy(&req.pulse, pulse, sizeof(*pulse));
 
-	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SET_RDD_TH,
-				   &req, sizeof(req), true);
+	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SET_RDD_TH, &req,
+				 sizeof(req), true);
 }
 
 int mt7915_mcu_set_radar_th(struct mt7915_dev *dev, int index,
@@ -3176,8 +3150,8 @@ int mt7915_mcu_set_radar_th(struct mt7915_dev *dev, int index,
 
 	memcpy(&req.pattern, pattern, sizeof(*pattern));
 
-	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SET_RDD_TH,
-				   &req, sizeof(req), true);
+	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SET_RDD_TH, &req,
+				 sizeof(req), true);
 }
 
 int mt7915_mcu_set_chan_info(struct mt7915_phy *phy, int cmd)
@@ -3229,7 +3203,7 @@ int mt7915_mcu_set_chan_info(struct mt7915_phy *phy, int cmd)
 		req.center_ch2 = ieee80211_frequency_to_channel(freq2);
 	}
 
-	return __mt76_mcu_send_msg(&dev->mt76, cmd, &req, sizeof(req), true);
+	return mt76_mcu_send_msg(&dev->mt76, cmd, &req, sizeof(req), true);
 }
 
 int mt7915_mcu_set_eeprom(struct mt7915_dev *dev)
@@ -3243,8 +3217,8 @@ int mt7915_mcu_set_eeprom(struct mt7915_dev *dev)
 		.format = EE_FORMAT_WHOLE,
 	};
 
-	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_EFUSE_BUFFER_MODE,
-				   &req, sizeof(req), true);
+	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_EFUSE_BUFFER_MODE,
+				 &req, sizeof(req), true);
 }
 
 int mt7915_mcu_get_eeprom(struct mt7915_dev *dev, u32 offset)
@@ -3252,9 +3226,22 @@ int mt7915_mcu_get_eeprom(struct mt7915_dev *dev, u32 offset)
 	struct mt7915_mcu_eeprom_info req = {
 		.addr = cpu_to_le32(round_down(offset, 16)),
 	};
+	struct mt7915_mcu_eeprom_info *res;
+	struct sk_buff *skb;
+	int ret;
+	u8 *buf;
 
-	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_EFUSE_ACCESS, &req,
-				   sizeof(req), true);
+	ret = mt76_mcu_send_and_get_msg(&dev->mt76, MCU_EXT_CMD_EFUSE_ACCESS, &req,
+				sizeof(req), true, &skb);
+	if (ret)
+		return ret;
+
+	res = (struct mt7915_mcu_eeprom_info *)skb->data;
+	buf = dev->mt76.eeprom.data + le32_to_cpu(res->addr);
+	memcpy(buf, res->data, 16);
+	dev_kfree_skb(skb);
+
+	return 0;
 }
 
 int mt7915_mcu_get_temperature(struct mt7915_dev *dev, int index)
@@ -3269,8 +3256,8 @@ int mt7915_mcu_get_temperature(struct mt7915_dev *dev, int index)
 		.action = index,
 	};
 
-	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_THERMAL_CTRL, &req,
-				   sizeof(req), true);
+	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_THERMAL_CTRL, &req,
+				 sizeof(req), true);
 }
 
 int mt7915_mcu_get_rate_info(struct mt7915_dev *dev, u32 cmd, u16 wlan_idx)
@@ -3287,8 +3274,8 @@ int mt7915_mcu_get_rate_info(struct mt7915_dev *dev, u32 cmd, u16 wlan_idx)
 		.dump_group = cpu_to_le16(1),
 	};
 
-	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_RATE_CTRL, &req,
-				   sizeof(req), false);
+	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_RATE_CTRL, &req,
+				 sizeof(req), false);
 }
 
 int mt7915_mcu_set_txpower_sku(struct mt7915_phy *phy)
@@ -3338,9 +3325,9 @@ int mt7915_mcu_set_txpower_sku(struct mt7915_phy *phy)
 		idx += len;
 	}
 
-	return __mt76_mcu_send_msg(&dev->mt76,
-				   MCU_EXT_CMD_TX_POWER_FEATURE_CTRL,
-				   &req, sizeof(req), true);
+	return mt76_mcu_send_msg(&dev->mt76,
+				 MCU_EXT_CMD_TX_POWER_FEATURE_CTRL, &req,
+				 sizeof(req), true);
 }
 
 int mt7915_mcu_set_sku_en(struct mt7915_phy *phy, bool enable)
@@ -3357,9 +3344,9 @@ int mt7915_mcu_set_sku_en(struct mt7915_phy *phy, bool enable)
 		.sku_enable = enable,
 	};
 
-	return __mt76_mcu_send_msg(&dev->mt76,
-				   MCU_EXT_CMD_TX_POWER_FEATURE_CTRL,
-				   &req, sizeof(req), true);
+	return mt76_mcu_send_msg(&dev->mt76,
+				 MCU_EXT_CMD_TX_POWER_FEATURE_CTRL, &req,
+				 sizeof(req), true);
 }
 
 int mt7915_mcu_set_ser(struct mt7915_dev *dev, u8 action, u8 set, u8 band)
@@ -3375,8 +3362,8 @@ int mt7915_mcu_set_ser(struct mt7915_dev *dev, u8 action, u8 set, u8 band)
 		.band = band,
 	};
 
-	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SET_SER_TRIGGER,
-				   &req, sizeof(req), false);
+	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SET_SER_TRIGGER,
+				 &req, sizeof(req), false);
 }
 
 int mt7915_mcu_set_txbf_type(struct mt7915_dev *dev)
@@ -3393,8 +3380,8 @@ int mt7915_mcu_set_txbf_type(struct mt7915_dev *dev)
 		.ibf = false,
 	};
 
-	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_TXBF_ACTION,
-				   &req, sizeof(req), true);
+	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_TXBF_ACTION, &req,
+				 sizeof(req), true);
 }
 
 int mt7915_mcu_set_txbf_sounding(struct mt7915_dev *dev)
@@ -3412,8 +3399,8 @@ int mt7915_mcu_set_txbf_sounding(struct mt7915_dev *dev)
 		.snd_mode = MT_BF_PROCESSING,
 	};
 
-	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_TXBF_ACTION,
-				   &req, sizeof(req), true);
+	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_TXBF_ACTION, &req,
+				 sizeof(req), true);
 }
 
 int mt7915_mcu_add_obss_spr(struct mt7915_dev *dev, struct ieee80211_vif *vif,
@@ -3437,6 +3424,100 @@ int mt7915_mcu_add_obss_spr(struct mt7915_dev *dev, struct ieee80211_vif *vif,
 		.val = enable,
 	};
 
-	return __mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SET_SPR,
-				   &req, sizeof(req), true);
+	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD_SET_SPR, &req,
+				 sizeof(req), true);
+}
+
+int mt7915_mcu_get_rx_rate(struct mt7915_phy *phy, struct ieee80211_vif *vif,
+			   struct ieee80211_sta *sta, struct rate_info *rate)
+{
+	struct mt7915_vif *mvif = (struct mt7915_vif *)vif->drv_priv;
+	struct mt7915_sta *msta = (struct mt7915_sta *)sta->drv_priv;
+	struct mt7915_dev *dev = phy->dev;
+	struct mt76_phy *mphy = phy->mt76;
+	struct {
+		u8 category;
+		u8 band;
+		__le16 wcid;
+	} __packed req = {
+		.category = MCU_PHY_STATE_CONTENTION_RX_RATE,
+		.band = mvif->band_idx,
+		.wcid = cpu_to_le16(msta->wcid.idx),
+	};
+	struct ieee80211_supported_band *sband;
+	struct mt7915_mcu_phy_rx_info *res;
+	struct sk_buff *skb;
+	u16 flags = 0;
+	int ret;
+	int i;
+
+	ret = mt76_mcu_send_and_get_msg(&dev->mt76, MCU_EXT_CMD_PHY_STAT_INFO,
+					&req, sizeof(req), true, &skb);
+	if (ret)
+		return ret;
+
+	res = (struct mt7915_mcu_phy_rx_info *)skb->data;
+
+	rate->mcs = res->rate;
+	rate->nss = res->nsts + 1;
+
+	switch (res->mode) {
+	case MT_PHY_TYPE_CCK:
+	case MT_PHY_TYPE_OFDM:
+		if (mphy->chandef.chan->band == NL80211_BAND_5GHZ)
+			sband = &mphy->sband_5g.sband;
+		else
+			sband = &mphy->sband_2g.sband;
+
+		for (i = 0; i < sband->n_bitrates; i++) {
+			if (rate->mcs != (sband->bitrates[i].hw_value & 0xf))
+				continue;
+
+			rate->legacy = sband->bitrates[i].bitrate;
+			break;
+		}
+		break;
+	case MT_PHY_TYPE_HT:
+	case MT_PHY_TYPE_HT_GF:
+		rate->mcs += (rate->nss - 1) * 8;
+		flags |= RATE_INFO_FLAGS_MCS;
+
+		if (res->gi)
+			flags |= RATE_INFO_FLAGS_SHORT_GI;
+		break;
+	case MT_PHY_TYPE_VHT:
+		flags |= RATE_INFO_FLAGS_VHT_MCS;
+
+		if (res->gi)
+			flags |= RATE_INFO_FLAGS_SHORT_GI;
+		break;
+	case MT_PHY_TYPE_HE_SU:
+	case MT_PHY_TYPE_HE_EXT_SU:
+	case MT_PHY_TYPE_HE_TB:
+	case MT_PHY_TYPE_HE_MU:
+		rate->he_gi = res->gi;
+
+		flags |= RATE_INFO_FLAGS_HE_MCS;
+		break;
+	default:
+		break;
+	}
+	rate->flags = flags;
+
+	switch (res->bw) {
+	case IEEE80211_STA_RX_BW_160:
+		rate->bw = RATE_INFO_BW_160;
+		break;
+	case IEEE80211_STA_RX_BW_80:
+		rate->bw = RATE_INFO_BW_80;
+		break;
+	case IEEE80211_STA_RX_BW_40:
+		rate->bw = RATE_INFO_BW_40;
+		break;
+	default:
+		rate->bw = RATE_INFO_BW_20;
+		break;
+	}
+
+	return 0;
 }
